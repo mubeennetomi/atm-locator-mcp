@@ -89,15 +89,22 @@ async function overpassQuery(query) {
 }
 
 async function findBoaAtms(lat, lon, radiusM, limit) {
-  const q = `
+const q = `
 [out:json][timeout:25];
 (
+  // ATM nodes/ways/relations tagged as BoA
   nwr(around:${radiusM},${lat},${lon})["amenity"="atm"]["operator"~"Bank of America|BofA",i];
   nwr(around:${radiusM},${lat},${lon})["amenity"="atm"]["brand"~"Bank of America|BofA",i];
   nwr(around:${radiusM},${lat},${lon})["amenity"="atm"]["name"~"Bank of America|BofA",i];
+
+  // Bank branches that indicate an ATM is available
+  nwr(around:${radiusM},${lat},${lon})["amenity"="bank"]["atm"="yes"]["name"~"Bank of America|BofA",i];
+  nwr(around:${radiusM},${lat},${lon})["amenity"="bank"]["atm"="yes"]["brand"~"Bank of America|BofA",i];
+  nwr(around:${radiusM},${lat},${lon})["amenity"="bank"]["atm"="yes"]["operator"~"Bank of America|BofA",i];
 );
 out center tags;
 `;
+
 
   const data = await overpassQuery(q);
   const elements = data && data.elements ? data.elements : [];
