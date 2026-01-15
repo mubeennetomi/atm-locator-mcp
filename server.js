@@ -7,221 +7,157 @@ const {
   StreamableHTTPServerTransport,
 } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 
-// Identify your app to upstream services
 const USER_AGENT = "netomi-atm-locator-demo/1.0 (contact: mubeen@netomi.com)";
 
-// Geocoding
-const NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
+// Never hardcode secrets. Set this in env:
+// export SERPAPI_KEY="..."
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
-// Overpass endpoints (fallback helps with 504s)
-const OVERPASS_ENDPOINTS = [
-  "https://overpass-api.de/api/interpreter",
-  "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass.private.coffee/api/interpreter",
-];
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function toMapsLinkFromLatLon(lat, lon) {
+  if (typeof lat !== "number" || typeof lon !== "number") return null;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+    `${lat},${lon}`
+  )}`;
 }
 
-function haversineMeters(lat1, lon1, lat2, lon2) {
-  const R = 6371000;
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
+function toMapsLinkFromPlaceId(placeId) {
+  if (!placeId) return null;
+  return `https://www.google.com/maps/search/?api=1&query_place_id=${encodeURIComponent(
+    placeId
+  )}`;
 }
 
-// Nominatim throttle + cache
-let lastNominatimCallAt = 0;
-const geoCache = new Map();
+function normalizeText(s) {
+  return String(s || "").toLowerCase();
+}
 
-async function geocodePlace(query) {
-  const key = query.trim().toLowerCase();
-  if (geoCache.has(key)) return geoCache.get(key);
+function looksLikeBoaAtm(item) {
+  // SerpApi results vary, so we check several fields.
+  // Keep it simple and transparent.
+  const hay = [
+    item.title,
+    item.name,
+    item.description,
+    item.type,
+    item.categories && item.categories.join(" "),
+    item.address,
+  ]
+    .filter(Boolean)
+    .join(" | ");
 
-  const now = Date.now();
-  const waitMs = Math.max(0, 1100 - (now - lastNominatimCallAt));
-  if (waitMs) await sleep(waitMs);
-  lastNominatimCallAt = Date.now();
+  const t = normalizeText(hay);
 
-  const url = new URL(`${NOMINATIM_BASE}/search`);
-  url.searchParams.set("q", query);
-  url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "1");
+  // "Bank of America" / "BofA" and "ATM"
+  const isBoa =
+    t.includes("bank of america") ||
+    t.includes("bofa") ||
+    t.includes("bankofamerica");
+  const isAtm = t.includes("atm");
+
+  // Often Google Maps listings are "Bank of America (with Drive-thru ATM)" etc.
+  return isBoa && (isAtm || t.includes("drive") || t.includes("cash"));
+}
+
+async function serpApiMapsSearch({ userQuery, limit }) {
+  if (!SERPAPI_KEY) {
+    throw new Error(
+      "Missing SERPAPI_KEY env var. Set it before running the server."
+    );
+  }
+
+  // Force brand + intent in the query so results skew strongly to BoA ATMs
+  // Even if user says "find me an atm near ...", we rewrite to "Bank of America ATM near ..."
+  const q = `Bank of America ATM near ${userQuery}`;
+
+  const url = new URL("https://serpapi.com/search");
+  url.searchParams.set("engine", "google_maps");
+  url.searchParams.set("type", "search");
+  url.searchParams.set("google_domain", "google.com");
+  url.searchParams.set("hl", "en");
+  url.searchParams.set("q", q);
+  url.searchParams.set("api_key", SERPAPI_KEY);
+
+  // Optional: If you have user lat/lon, you can pass ll in the request.
+  // For now we rely on the "near <place>" query text.
 
   const res = await fetch(url.toString(), {
     headers: {
       "User-Agent": USER_AGENT,
       "Accept": "application/json",
-      "Accept-Language": "en",
-      "Referer": "http://localhost/",
     },
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Nominatim error: ${res.status} ${body}`.slice(0, 300));
+    throw new Error(`SerpApi error: ${res.status} ${body}`.slice(0, 500));
   }
 
   const data = await res.json();
-  const result =
-    data && data.length
-      ? {
-          lat: Number(data[0].lat),
-          lon: Number(data[0].lon),
-          display_name: data[0].display_name,
-        }
-      : null;
 
-  geoCache.set(key, result);
-  return result;
-}
+  // SerpApi Google Maps engine typically returns `local_results`
+  const raw = Array.isArray(data.local_results) ? data.local_results : [];
 
-// Overpass query with endpoint fallback + retry on 504/429
-async function overpassQuery(query) {
-  let lastErr;
+  // Filter to BoA ATMs and cap
+  const filtered = raw.filter(looksLikeBoaAtm).slice(0, Math.max(1, Math.min(limit, 25)));
 
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    // small retry loop per endpoint
-    const delays = [0, 600, 1200];
-    for (const d of delays) {
-      if (d) await sleep(d);
+  // Map into a stable shape
+  const items = filtered.map((r) => {
+    const gps = r.gps_coordinates || r.gps_coordinates || null;
+    const lat = gps && typeof gps.latitude === "number" ? gps.latitude : null;
+    const lon = gps && typeof gps.longitude === "number" ? gps.longitude : null;
 
-      try {
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent": USER_AGENT,
-          },
-          body: new URLSearchParams({ data: query }).toString(),
-        });
+    // Try place_id first, then lat/lon, else fallback to query link
+    const mapsLink =
+      toMapsLinkFromPlaceId(r.place_id) ||
+      toMapsLinkFromLatLon(lat, lon) ||
+      (r.directions_link || r.website || null);
 
-        if (!res.ok) {
-          const txt = await res.text().catch(() => "");
-          const msg = `Overpass error: ${res.status} ${txt}`.slice(0, 300);
+    return {
+      name: r.title || r.name || "Bank of America ATM",
+      address: r.address || null,
+      phone: r.phone || null,
+      rating: typeof r.rating === "number" ? r.rating : null,
+      reviews: typeof r.reviews === "number" ? r.reviews : null,
+      hours: r.hours || r.open_state || null,
+      location: lat !== null && lon !== null ? { lat, lon } : null,
+      maps_link: mapsLink,
+      place_id: r.place_id || null,
+      raw: r,
+    };
+  });
 
-          // Retry on overload-ish codes
-          if (res.status === 429 || res.status === 504) {
-            lastErr = new Error(msg);
-            continue;
-          }
-          throw new Error(msg);
-        }
-
-        return await res.json();
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-  }
-
-  throw lastErr || new Error("Overpass error: all endpoints failed");
-}
-
-async function findAtms(lat, lon, radiusM, limit) {
-  // Keep query cheap to reduce 504s: timeout 15, output capped
-  const q = `
-[out:json][timeout:15];
-(
-  nwr(around:${radiusM},${lat},${lon})["amenity"="atm"];
-);
-out center tags 200;
-`;
-
-  const data = await overpassQuery(q);
-  const elements = data && data.elements ? data.elements : [];
-
-  const items = elements
-    .map((el) => {
-      const centerLat = el.type === "node" ? el.lat : el.center && el.center.lat;
-      const centerLon = el.type === "node" ? el.lon : el.center && el.center.lon;
-
-      if (typeof centerLat !== "number" || typeof centerLon !== "number") return null;
-
-      const tags = el.tags || {};
-      const distance_m = Math.round(haversineMeters(lat, lon, centerLat, centerLon));
-
-      return {
-        name: tags.name || "ATM",
-        operator: tags.operator || null,
-        brand: tags.brand || null,
-        address: {
-          street: tags["addr:street"] || null,
-          housenumber: tags["addr:housenumber"] || null,
-          city: tags["addr:city"] || null,
-          state: tags["addr:state"] || null,
-          postcode: tags["addr:postcode"] || null,
-        },
-        location: { lat: centerLat, lon: centerLon },
-        distance_m,
-        osm: { type: el.type, id: el.id },
-        tags,
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => a.distance_m - b.distance_m)
-    .slice(0, Math.max(1, Math.min(limit, 25)));
-
-  return items;
+  return {
+    count: items.length,
+    items,
+    meta: {
+      rewritten_query: q,
+    },
+  };
 }
 
 // MCP server
 const server = new McpServer({
   name: "atm-locator-mcp",
-  version: "0.2.0",
+  version: "1.0.0",
 });
 
 server.tool(
-  "geocode_place",
-  { query: z.string().min(2) },
-  async ({ query }) => {
-    const result = await geocodePlace(query);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              result,
-              attribution:
-                "Geocoding by OpenStreetMap Nominatim. Data © OpenStreetMap contributors (ODbL).",
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
-);
-
-server.tool(
-  "find_atms",
+  "find_boa_atms",
   {
-    lat: z.number(),
-    lon: z.number(),
-    radius_m: z.number().min(200).max(50000).default(3000),
+    query: z.string().min(3).describe('User query like "find me an atm near times square new york"'),
     limit: z.number().min(1).max(25).default(10),
   },
-  async ({ lat, lon, radius_m, limit }) => {
-    const items = await findAtms(lat, lon, radius_m, limit);
+  async ({ query, limit }) => {
+    const result = await serpApiMapsSearch({ userQuery: query, limit });
     return {
       content: [
         {
           type: "text",
           text: JSON.stringify(
             {
-              count: items.length,
-              items,
+              ...result,
               attribution:
-                "ATM data from OpenStreetMap via Overpass API. Data © OpenStreetMap contributors (ODbL).",
+                "Results powered by SerpApi Google Maps engine; map links point to Google Maps.",
             },
             null,
             2
@@ -245,13 +181,11 @@ async function main() {
   });
 
   const transport = new StreamableHTTPServerTransport({
-    // Use a real session id generator to avoid SSE Conflict issues in some clients
     sessionIdGenerator: () => crypto.randomUUID(),
   });
 
   await server.connect(transport);
 
-  // Important: allow GET (SSE) + POST on the same path
   app.all("/mcp", async (req, res) => {
     try {
       await transport.handleRequest(req, res, req.body);
