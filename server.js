@@ -13,6 +13,18 @@ const USER_AGENT = "netomi-atm-locator-demo/1.0 (contact: mubeen@netomi.com)";
 // export SERPAPI_KEY="..."
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
+function logTool(label, data) {
+  try {
+    console.log(
+      `[MCP][${label}]`,
+      JSON.stringify(data, null, 2)
+    );
+  } catch {
+    console.log(`[MCP][${label}]`, data);
+  }
+}
+
+
 function toMapsLinkFromLatLon(lat, lon) {
   if (typeof lat !== "number" || typeof lon !== "number") return null;
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
@@ -112,18 +124,24 @@ async function serpApiMapsSearch({ userQuery, limit }) {
       toMapsLinkFromLatLon(lat, lon) ||
       (r.directions_link || r.website || null);
 
-    return {
-      name: r.title || r.name || "Bank of America ATM",
-      address: r.address || null,
-      phone: r.phone || null,
-      rating: typeof r.rating === "number" ? r.rating : null,
-      reviews: typeof r.reviews === "number" ? r.reviews : null,
-      hours: r.hours || r.open_state || null,
-      location: lat !== null && lon !== null ? { lat, lon } : null,
-      maps_link: mapsLink,
-      place_id: r.place_id || null,
-      raw: r,
-    };
+return {
+  name: r.title || r.name || "Bank of America ATM",
+  address: r.address || null,
+  phone: r.phone || null,
+  rating: typeof r.rating === "number" ? r.rating : null,
+  reviews: typeof r.reviews === "number" ? r.reviews : null,
+  hours: r.hours || r.open_state || null,
+  location: lat !== null && lon !== null ? { lat, lon } : null,
+  maps_link: mapsLink,
+  place_id: r.place_id || null,
+
+  // Optional small debug only:
+  source: {
+    data_id: r.data_id || null,
+    type: r.type || null
+  }
+};
+
   });
 
   return {
@@ -175,6 +193,7 @@ function forceToolDescription(mcpServer, toolName, description) {
 
 
 
+
 server.registerTool(
   "locate_atms",
   {
@@ -190,37 +209,64 @@ server.registerTool(
     ].join(" "),
     inputSchema: LocateAtmsInput,
   },
-  async ({ query, limit }) => {
-    const result = await serpApiMapsSearch({ userQuery: query, limit });
+  async (input) => {
+    // 🔹 LOG INPUT
+    logTool("locate_atms:input", input);
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              ...result,
-              assumption: "Results are limited to Bank of America ATMs by default.",
-              attribution:
-                "Results powered by SerpApi Google Maps engine; map links point to Google Maps.",
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
+    try {
+      const { query, limit } = input;
+
+      const result = await serpApiMapsSearch({
+        userQuery: query,
+        limit,
+      });
+
+      // 🔹 LOG OUTPUT
+      logTool("locate_atms:output", result);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ...result,
+                assumption:
+                  "Results are limited to Bank of America ATMs by default.",
+                attribution:
+                  "Results powered by SerpApi Google Maps engine; map links point to Google Maps.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      // 🔹 LOG ERROR (THIS IS CRITICAL)
+      console.error("[MCP][locate_atms:error]", err);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: "Failed to fetch ATMs",
+                message: err?.message || String(err),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
   }
 );
 
 
-const ok = forceToolDescription(
-  server,
-  "locate_atms",
-  "Find nearby ATMs (assumes Bank of America). Use whenever the user asks for an ATM, nearest ATM, or cash withdrawal near a place. Input is location text or a full sentence. Returns 5 results by default with Google Maps links."
-);
 
-console.log("Tool description patched:", ok);
 
 
 
@@ -281,6 +327,14 @@ async function main() {
     return { sessionId, transport: sessions.get(sessionId) };
   }
 
+  app.use("/mcp", (req, res, next) => {
+  console.log(`[MCP][HTTP] ${req.method} /mcp`);
+  res.on("close", () => console.log(`[MCP][HTTP] ${req.method} /mcp closed`));
+  res.on("finish", () => console.log(`[MCP][HTTP] ${req.method} /mcp finished`));
+  next();
+});
+
+
   app.all("/mcp", async (req, res) => {
     try {
       // SSE hints
@@ -295,6 +349,14 @@ async function main() {
 
       // Help clients keep the session
       res.setHeader("mcp-session-id", sessionId);
+
+if (req.method === "GET") {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+}
+
 
       await transport.handleRequest(req, res, req.body);
 
