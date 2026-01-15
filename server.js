@@ -1,29 +1,23 @@
+// server.js
+// MCP: ATM locator (assumes Bank of America ATMs) using SerpApi Google Maps engine
+// Transport: Legacy SSE (GET /sse + POST /messages) compatible with MCP Inspector + Netomi
+
 const express = require("express");
-const crypto = require("crypto");
-const { z } = require("zod/v3");
+const { z } = require("zod");
 
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
-const {
-  StreamableHTTPServerTransport,
-} = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
 
 const USER_AGENT = "netomi-atm-locator-demo/1.0 (contact: mubeen@netomi.com)";
-
-// Never hardcode secrets. Set this in env:
-// export SERPAPI_KEY="..."
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
 function logTool(label, data) {
   try {
-    console.log(
-      `[MCP][${label}]`,
-      JSON.stringify(data, null, 2)
-    );
+    console.log(`[MCP][${label}]`, JSON.stringify(data, null, 2));
   } catch {
     console.log(`[MCP][${label}]`, data);
   }
 }
-
 
 function toMapsLinkFromLatLon(lat, lon) {
   if (typeof lat !== "number" || typeof lon !== "number") return null;
@@ -44,14 +38,12 @@ function normalizeText(s) {
 }
 
 function looksLikeBoaAtm(item) {
-  // SerpApi results vary, so we check several fields.
-  // Keep it simple and transparent.
   const hay = [
     item.title,
     item.name,
     item.description,
     item.type,
-    item.categories && item.categories.join(" "),
+    Array.isArray(item.categories) ? item.categories.join(" ") : "",
     item.address,
   ]
     .filter(Boolean)
@@ -59,26 +51,32 @@ function looksLikeBoaAtm(item) {
 
   const t = normalizeText(hay);
 
-  // "Bank of America" / "BofA" and "ATM"
   const isBoa =
     t.includes("bank of america") ||
     t.includes("bofa") ||
     t.includes("bankofamerica");
+
   const isAtm = t.includes("atm");
 
-  // Often Google Maps listings are "Bank of America (with Drive-thru ATM)" etc.
-  return isBoa && (isAtm || t.includes("drive") || t.includes("cash"));
+  return isBoa && isAtm;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function serpApiMapsSearch({ userQuery, limit }) {
   if (!SERPAPI_KEY) {
-    throw new Error(
-      "Missing SERPAPI_KEY env var. Set it before running the server."
-    );
+    throw new Error("Missing SERPAPI_KEY env var");
   }
 
-  // Force brand + intent in the query so results skew strongly to BoA ATMs
-  // Even if user says "find me an atm near ...", we rewrite to "Bank of America ATM near ..."
+  // Force BoA ATM intent even if user doesn't mention it
   const q = `Bank of America ATM near ${userQuery}`;
 
   const url = new URL("https://serpapi.com/search");
@@ -89,59 +87,57 @@ async function serpApiMapsSearch({ userQuery, limit }) {
   url.searchParams.set("q", q);
   url.searchParams.set("api_key", SERPAPI_KEY);
 
-  // Optional: If you have user lat/lon, you can pass ll in the request.
-  // For now we rely on the "near <place>" query text.
-
-  const res = await fetch(url.toString(), {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept": "application/json",
+  const res = await fetchWithTimeout(
+    url.toString(),
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/json",
+      },
     },
-  });
+    8000
+  );
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`SerpApi error: ${res.status} ${body}`.slice(0, 500));
+    throw new Error(
+      `SerpApi error: ${res.status} ${String(body).slice(0, 300)}`
+    );
   }
 
   const data = await res.json();
-
-  // SerpApi Google Maps engine typically returns `local_results`
   const raw = Array.isArray(data.local_results) ? data.local_results : [];
 
-  // Filter to BoA ATMs and cap
-  const filtered = raw.filter(looksLikeBoaAtm).slice(0, Math.max(1, Math.min(limit, 25)));
+  const filtered = raw
+    .filter(looksLikeBoaAtm)
+    .slice(0, Math.max(1, Math.min(limit ?? 5, 25)));
 
-  // Map into a stable shape
   const items = filtered.map((r) => {
-    const gps = r.gps_coordinates || r.gps_coordinates || null;
+    const gps = r.gps_coordinates || null;
     const lat = gps && typeof gps.latitude === "number" ? gps.latitude : null;
     const lon = gps && typeof gps.longitude === "number" ? gps.longitude : null;
 
-    // Try place_id first, then lat/lon, else fallback to query link
     const mapsLink =
       toMapsLinkFromPlaceId(r.place_id) ||
       toMapsLinkFromLatLon(lat, lon) ||
-      (r.directions_link || r.website || null);
+      r.directions_link ||
+      null;
 
-return {
-  name: r.title || r.name || "Bank of America ATM",
-  address: r.address || null,
-  phone: r.phone || null,
-  rating: typeof r.rating === "number" ? r.rating : null,
-  reviews: typeof r.reviews === "number" ? r.reviews : null,
-  hours: r.hours || r.open_state || null,
-  location: lat !== null && lon !== null ? { lat, lon } : null,
-  maps_link: mapsLink,
-  place_id: r.place_id || null,
-
-  // Optional small debug only:
-  source: {
-    data_id: r.data_id || null,
-    type: r.type || null
-  }
-};
-
+    return {
+      name: r.title || r.name || "Bank of America ATM",
+      address: r.address || null,
+      phone: r.phone || null,
+      rating: typeof r.rating === "number" ? r.rating : null,
+      reviews: typeof r.reviews === "number" ? r.reviews : null,
+      hours: r.hours || r.open_state || null,
+      location: lat !== null && lon !== null ? { lat, lon } : null,
+      maps_link: mapsLink,
+      place_id: r.place_id || null,
+      source: {
+        data_id: r.data_id || null,
+        type: r.type || null,
+      },
+    };
   });
 
   return {
@@ -159,69 +155,59 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
+// Register tool with explicit top-level description (Netomi shows this)
 const LocateAtmsInput = {
   query: z
     .string()
     .min(3)
     .describe(
-      'User location intent such as "times square new york", "near 94105", or the full user sentence.'
+      'User location intent such as "times square new york", "near 94105", or full user sentence.'
     ),
-
   limit: z
     .number()
     .min(1)
     .max(25)
     .default(5)
-    .describe("Maximum number of Bank of America ATMs to return. Defaults to 5."),
+    .describe("Max number of ATMs to return. Defaults to 5."),
 };
-
-
-function forceToolDescription(mcpServer, toolName, description) {
-  // Try to find an internal Map that stores tools by name and patch it.
-  for (const k of Object.keys(mcpServer)) {
-    const v = mcpServer[k];
-    if (v && typeof v.get === "function" && typeof v.set === "function") {
-      const tool = v.get(toolName);
-      if (tool && typeof tool === "object") {
-        tool.description = description;
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-
-
 
 server.registerTool(
   "locate_atms",
   {
     title: "Locate ATMs",
     description: [
-      "Find nearby ATMs.",
-      "IMPORTANT: This tool ALWAYS returns Bank of America ATMs, even if the user does not mention the bank name.",
-      "Use whenever the user asks for an ATM, nearest ATM, cash withdrawal location, or ATM near a place.",
-      "Do NOT ask which bank.",
-      "Returns 5 results by default (unless limit is specified).",
-      'Examples: "find me an atm near times square new york", "nearest atm", "atm near 94105".',
-      "Output includes Google Maps links.",
+      "Find nearby ATMs (assumes Bank of America ATMs even if the user does not mention the bank).",
+      "Use this whenever the user asks for an ATM, nearest ATM, cash withdrawal, or ATM near a place/address/landmark/city.",
+      "Input is free-form location text or the full user sentence. Returns 5 results by default.",
+      "Output includes addresses and Google Maps links.",
+      'Examples: "find me an atm near times square new york", "nearest atm", "atm near 94105", "where can I withdraw cash near me".',
     ].join(" "),
     inputSchema: LocateAtmsInput,
   },
   async (input) => {
-    // 🔹 LOG INPUT
     logTool("locate_atms:input", input);
 
+    const query = input?.query;
+    const limit = input?.limit ?? 5;
+
+    if (!query) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: "Missing required field: query" },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
     try {
-      const { query, limit } = input;
+      const result = await serpApiMapsSearch({ userQuery: query, limit });
 
-      const result = await serpApiMapsSearch({
-        userQuery: query,
-        limit,
-      });
-
-      // 🔹 LOG OUTPUT
       logTool("locate_atms:output", result);
 
       return {
@@ -231,8 +217,7 @@ server.registerTool(
             text: JSON.stringify(
               {
                 ...result,
-                assumption:
-                  "Results are limited to Bank of America ATMs by default.",
+                assumption: "Results are limited to Bank of America ATMs by default.",
                 attribution:
                   "Results powered by SerpApi Google Maps engine; map links point to Google Maps.",
               },
@@ -243,8 +228,12 @@ server.registerTool(
         ],
       };
     } catch (err) {
-      // 🔹 LOG ERROR (THIS IS CRITICAL)
       console.error("[MCP][locate_atms:error]", err);
+
+      const isAbort = err && err.name === "AbortError";
+      const msg = isAbort
+        ? "SerpApi request timed out. Try a more specific location or retry."
+        : err?.message || String(err);
 
       return {
         content: [
@@ -252,8 +241,8 @@ server.registerTool(
             type: "text",
             text: JSON.stringify(
               {
-                error: "Failed to fetch ATMs",
-                message: err?.message || String(err),
+                error: "Failed to locate ATMs",
+                message: msg,
               },
               null,
               2
@@ -265,123 +254,84 @@ server.registerTool(
   }
 );
 
-
-
-
-
-
 async function main() {
   const app = express();
 
-  // Parse JSON only for non-GET (SSE GET should not be parsed)
+  // Only parse JSON for POST /messages
   app.use((req, res, next) => {
     if (req.method === "GET") return next();
     return express.json({ limit: "1mb" })(req, res, next);
   });
 
-  app.get("/", (_req, res) => {
-    res.status(200).send("ATM Locator MCP is running. Use /mcp");
-  });
+  app.get("/", (_req, res) =>
+    res
+      .status(200)
+      .send("ATM Locator MCP running. Use GET /sse and POST /messages")
+  );
+  app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-  app.get("/health", (_req, res) => {
-    res.status(200).send("ok");
-  });
+  // Session registry: sessionId -> transport
+  const transports = new Map();
 
-  // One MCP server instance is fine
-  const mcpServer = server;
+  // SSE handshake endpoint
+  app.get("/sse", async (req, res) => {
+    try {
+      console.log("[MCP][HTTP] GET /sse");
 
-  // One transport per session
-  const sessions = new Map(); // sessionId -> transport
+      // Helpful for proxies (nginx, cloudflare, etc.)
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
 
-  function getSessionId(req) {
-    // MCP Streamable HTTP uses a session id. Depending on client, it can appear in:
-    // - query param: ?sessionId=...
-    // - header: mcp-session-id
-    // We support both.
-    return (
-      (req.query && (req.query.sessionId || req.query.session_id)) ||
-      req.headers["mcp-session-id"] ||
-      req.headers["mcp-sessionid"] ||
-      null
-    );
-  }
+      const transport = new SSEServerTransport("/messages", res);
+      transports.set(transport.sessionId, transport);
 
-  async function getOrCreateTransport(req) {
-    let sessionId = getSessionId(req);
+      console.log("[MCP][SSE] session started:", transport.sessionId);
 
-    // If client did not provide one yet, create one and return it in a header.
-    // Some clients will send a new session id on the next request.
-    if (!sessionId) {
-      sessionId = crypto.randomUUID();
-    }
-
-    if (!sessions.has(sessionId)) {
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => sessionId,
+      res.on("close", () => {
+        console.log("[MCP][SSE] session closed:", transport.sessionId);
+        transports.delete(transport.sessionId);
       });
 
-      await mcpServer.connect(transport);
-      sessions.set(sessionId, transport);
-    }
-
-    return { sessionId, transport: sessions.get(sessionId) };
-  }
-
-  app.use("/mcp", (req, res, next) => {
-  console.log(`[MCP][HTTP] ${req.method} /mcp`);
-  res.on("close", () => console.log(`[MCP][HTTP] ${req.method} /mcp closed`));
-  res.on("finish", () => console.log(`[MCP][HTTP] ${req.method} /mcp finished`));
-  next();
-});
-
-
-  app.all("/mcp", async (req, res) => {
-    try {
-      // SSE hints
-      if (req.method === "GET") {
-        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-        res.setHeader("Cache-Control", "no-cache, no-transform");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-      }
-
-      const { sessionId, transport } = await getOrCreateTransport(req);
-
-      // Help clients keep the session
-      res.setHeader("mcp-session-id", sessionId);
-
-if (req.method === "GET") {
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-}
-
-
-      await transport.handleRequest(req, res, req.body);
-
-      // Cleanup on DELETE if client ends session
-      if (req.method === "DELETE") {
-        sessions.delete(sessionId);
-      }
+      await server.connect(transport);
     } catch (error) {
-      console.error("Error handling MCP request:", error);
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
-          id: null,
-        });
+      console.error("[MCP][SSE] /sse error:", error);
+      if (!res.headersSent) res.status(500).send("Failed to establish SSE session");
+    }
+  });
+
+  // Client-to-server messages endpoint
+  app.post("/messages", async (req, res) => {
+    try {
+      console.log("[MCP][HTTP] POST /messages");
+
+      const sessionId = String(req.query.sessionId || "");
+      const transport = transports.get(sessionId);
+
+      if (!transport) {
+        return res.status(400).send("No transport found for sessionId");
       }
+
+      // Some SDK/inspector combos require passing req.body explicitly
+      await transport.handlePostMessage(req, res, req.body);
+    } catch (error) {
+      console.error("[MCP][SSE] /messages error:", error);
+      if (!res.headersSent) res.status(500).send("Internal server error");
     }
   });
 
   const PORT = Number(process.env.PORT || 3337);
-  app.listen(PORT, () => {
-    console.log(`ATM Locator MCP running on http://localhost:${PORT}/mcp`);
+  const httpServer = app.listen(PORT, () => {
+    console.log(`ATM Locator MCP (SSE) running:`);
+    console.log(`  SSE:       http://localhost:${PORT}/sse`);
+    console.log(`  Messages:  http://localhost:${PORT}/messages`);
   });
-}
 
+  // Keep long-lived connections stable
+  httpServer.keepAliveTimeout = 70_000;
+  httpServer.headersTimeout = 75_000;
+  httpServer.requestTimeout = 0;
+}
 
 main().catch((err) => {
   console.error("Fatal startup error:", err);
