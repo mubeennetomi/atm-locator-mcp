@@ -1,4 +1,5 @@
 const express = require("express");
+const crypto = require("crypto");
 const { z } = require("zod");
 
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
@@ -6,14 +7,22 @@ const {
   StreamableHTTPServerTransport,
 } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 
-// Node 18+ has global fetch
+// Identify your app to upstream services
 const USER_AGENT = "netomi-atm-locator-demo/1.0 (contact: mubeen@netomi.com)";
 
-// Public endpoints (swap instances if needed)
+// Geocoding
 const NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
-const OVERPASS_INTERPRETER = "https://overpass-api.de/api/interpreter";
 
-const crypto = require("crypto");
+// Overpass endpoints (fallback helps with 504s)
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+];
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -28,6 +37,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+// Nominatim throttle + cache
 let lastNominatimCallAt = 0;
 const geoCache = new Map();
 
@@ -37,7 +47,7 @@ async function geocodePlace(query) {
 
   const now = Date.now();
   const waitMs = Math.max(0, 1100 - (now - lastNominatimCallAt));
-  if (waitMs) await new Promise((r) => setTimeout(r, waitMs));
+  if (waitMs) await sleep(waitMs);
   lastNominatimCallAt = Date.now();
 
   const url = new URL(`${NOMINATIM_BASE}/search`);
@@ -50,13 +60,13 @@ async function geocodePlace(query) {
       "User-Agent": USER_AGENT,
       "Accept": "application/json",
       "Accept-Language": "en",
-      "Referer": "http://localhost:3337/",
+      "Referer": "http://localhost/",
     },
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Nominatim error: ${res.status} ${body}`);
+    throw new Error(`Nominatim error: ${res.status} ${body}`.slice(0, 300));
   }
 
   const data = await res.json();
@@ -73,38 +83,57 @@ async function geocodePlace(query) {
   return result;
 }
 
-
+// Overpass query with endpoint fallback + retry on 504/429
 async function overpassQuery(query) {
-  const res = await fetch(OVERPASS_INTERPRETER, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "User-Agent": USER_AGENT,
-    },
-    body: new URLSearchParams({ data: query }).toString(),
-  });
+  let lastErr;
 
-  if (!res.ok) throw new Error(`Overpass error: ${res.status}`);
-  return await res.json();
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    // small retry loop per endpoint
+    const delays = [0, 600, 1200];
+    for (const d of delays) {
+      if (d) await sleep(d);
+
+      try {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": USER_AGENT,
+          },
+          body: new URLSearchParams({ data: query }).toString(),
+        });
+
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "");
+          const msg = `Overpass error: ${res.status} ${txt}`.slice(0, 300);
+
+          // Retry on overload-ish codes
+          if (res.status === 429 || res.status === 504) {
+            lastErr = new Error(msg);
+            continue;
+          }
+          throw new Error(msg);
+        }
+
+        return await res.json();
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+  }
+
+  throw lastErr || new Error("Overpass error: all endpoints failed");
 }
 
-async function findBoaAtms(lat, lon, radiusM, limit) {
-const q = `
-[out:json][timeout:25];
+async function findAtms(lat, lon, radiusM, limit) {
+  // Keep query cheap to reduce 504s: timeout 15, output capped
+  const q = `
+[out:json][timeout:15];
 (
-  // ATM nodes/ways/relations tagged as BoA
-  nwr(around:${radiusM},${lat},${lon})["amenity"="atm"]["operator"~"Bank of America|BofA",i];
-  nwr(around:${radiusM},${lat},${lon})["amenity"="atm"]["brand"~"Bank of America|BofA",i];
-  nwr(around:${radiusM},${lat},${lon})["amenity"="atm"]["name"~"Bank of America|BofA",i];
-
-  // Bank branches that indicate an ATM is available
-  nwr(around:${radiusM},${lat},${lon})["amenity"="bank"]["atm"="yes"]["name"~"Bank of America|BofA",i];
-  nwr(around:${radiusM},${lat},${lon})["amenity"="bank"]["atm"="yes"]["brand"~"Bank of America|BofA",i];
-  nwr(around:${radiusM},${lat},${lon})["amenity"="bank"]["atm"="yes"]["operator"~"Bank of America|BofA",i];
+  nwr(around:${radiusM},${lat},${lon})["amenity"="atm"];
 );
-out center tags;
+out center tags 200;
 `;
-
 
   const data = await overpassQuery(q);
   const elements = data && data.elements ? data.elements : [];
@@ -146,7 +175,7 @@ out center tags;
 // MCP server
 const server = new McpServer({
   name: "atm-locator-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 server.tool(
@@ -174,7 +203,7 @@ server.tool(
 );
 
 server.tool(
-  "find_boa_atms",
+  "find_atms",
   {
     lat: z.number(),
     lon: z.number(),
@@ -182,7 +211,7 @@ server.tool(
     limit: z.number().min(1).max(25).default(10),
   },
   async ({ lat, lon, radius_m, limit }) => {
-    const items = await findBoaAtms(lat, lon, radius_m, limit);
+    const items = await findAtms(lat, lon, radius_m, limit);
     return {
       content: [
         {
@@ -207,36 +236,36 @@ async function main() {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 
-const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: () => crypto.randomUUID(),
-});
+  app.get("/", (_req, res) => {
+    res.status(200).send("ATM Locator MCP is running. Use /mcp");
+  });
 
+  app.get("/health", (_req, res) => {
+    res.status(200).send("ok");
+  });
+
+  const transport = new StreamableHTTPServerTransport({
+    // Use a real session id generator to avoid SSE Conflict issues in some clients
+    sessionIdGenerator: () => crypto.randomUUID(),
+  });
 
   await server.connect(transport);
 
-app.all("/mcp", async (req, res) => {
-  try {
-    // For GET (SSE), req.body will be undefined. That's OK.
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error("Error handling MCP request:", error);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal server error" },
-        id: null,
-      });
+  // Important: allow GET (SSE) + POST on the same path
+  app.all("/mcp", async (req, res) => {
+    try {
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
     }
-  }
-});
-
-app.get("/", (_req, res) => {
-  res.status(200).send("ATM Locator MCP is running. Use /mcp");
-});
-
-app.get("/health", (_req, res) => {
-  res.status(200).send("ok");
-});
+  });
 
   const PORT = Number(process.env.PORT || 3337);
   app.listen(PORT, () => {
