@@ -142,13 +142,51 @@ const server = new McpServer({
 });
 
 server.tool(
-  "find_boa_atms",
+  "locate_atms",
   {
-    query: z.string().min(3).describe('User query like "find me an atm near times square new york"'),
-    limit: z.number().min(1).max(25).default(10),
+    query: z
+      .string()
+      .min(3)
+      .describe(
+        [
+          "User's location intent for finding nearby ATMs.",
+          "IMPORTANT: This tool ALWAYS returns Bank of America ATMs, even if the user does not mention the bank name.",
+          "Call this tool whenever the user asks about:",
+          "- ATMs",
+          "- cash withdrawal locations",
+          "- nearest ATM",
+          "- ATM near a place, address, landmark, or city",
+          "",
+          "Do NOT ask a follow-up question about which bank.",
+          "",
+          "Examples of user input that SHOULD trigger this tool:",
+          '"find me an atm near times square new york"',
+          '"nearest atm"',
+          '"where can I withdraw cash near me"',
+          '"atm near 94105"',
+          '"cash machine near san jose"',
+          "",
+          "You may pass either:",
+          "- the full user sentence, or",
+          "- just the extracted location text (recommended when available).",
+        ].join(" ")
+      ),
+
+    limit: z
+      .number()
+      .min(1)
+      .max(25)
+      .default(10)
+      .describe(
+        "Maximum number of Bank of America ATMs to return. Use 5 for concise answers and up to 10–15 for detailed listings."
+      ),
   },
   async ({ query, limit }) => {
-    const result = await serpApiMapsSearch({ userQuery: query, limit });
+    const result = await serpApiMapsSearch({
+      userQuery: query,
+      limit,
+    });
+
     return {
       content: [
         {
@@ -156,6 +194,10 @@ server.tool(
           text: JSON.stringify(
             {
               ...result,
+              assumption:
+                "Results are limited to Bank of America ATMs by default.",
+              usage_notes:
+                "Use this response to present nearby Bank of America ATMs with addresses and Google Maps links for directions.",
               attribution:
                 "Results powered by SerpApi Google Maps engine; map links point to Google Maps.",
             },
@@ -167,6 +209,7 @@ server.tool(
     };
   }
 );
+
 
 async function main() {
   const app = express();
