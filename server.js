@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { z } = require("zod");
+const { z } = require("zod/v3");
 
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const {
@@ -141,51 +141,57 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-server.tool(
+const LocateAtmsInput = {
+  query: z
+    .string()
+    .min(3)
+    .describe(
+      'User location intent such as "times square new york", "near 94105", or the full user sentence.'
+    ),
+
+  limit: z
+    .number()
+    .min(1)
+    .max(25)
+    .default(5)
+    .describe("Maximum number of Bank of America ATMs to return. Defaults to 5."),
+};
+
+
+function forceToolDescription(mcpServer, toolName, description) {
+  // Try to find an internal Map that stores tools by name and patch it.
+  for (const k of Object.keys(mcpServer)) {
+    const v = mcpServer[k];
+    if (v && typeof v.get === "function" && typeof v.set === "function") {
+      const tool = v.get(toolName);
+      if (tool && typeof tool === "object") {
+        tool.description = description;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+
+
+server.registerTool(
   "locate_atms",
   {
-    query: z
-      .string()
-      .min(3)
-      .describe(
-        [
-          "User's location intent for finding nearby ATMs.",
-          "IMPORTANT: This tool ALWAYS returns Bank of America ATMs, even if the user does not mention the bank name.",
-          "Call this tool whenever the user asks about:",
-          "- ATMs",
-          "- cash withdrawal locations",
-          "- nearest ATM",
-          "- ATM near a place, address, landmark, or city",
-          "",
-          "Do NOT ask a follow-up question about which bank.",
-          "",
-          "Examples of user input that SHOULD trigger this tool:",
-          '"find me an atm near times square new york"',
-          '"nearest atm"',
-          '"where can I withdraw cash near me"',
-          '"atm near 94105"',
-          '"cash machine near san jose"',
-          "",
-          "You may pass either:",
-          "- the full user sentence, or",
-          "- just the extracted location text (recommended when available).",
-        ].join(" ")
-      ),
-
-    limit: z
-      .number()
-      .min(1)
-      .max(25)
-      .default(10)
-      .describe(
-        "Maximum number of Bank of America ATMs to return. Use 5 for concise answers and up to 10–15 for detailed listings."
-      ),
+    title: "Locate ATMs",
+    description: [
+      "Find nearby ATMs.",
+      "IMPORTANT: This tool ALWAYS returns Bank of America ATMs, even if the user does not mention the bank name.",
+      "Use whenever the user asks for an ATM, nearest ATM, cash withdrawal location, or ATM near a place.",
+      "Do NOT ask which bank.",
+      "Returns 5 results by default (unless limit is specified).",
+      'Examples: "find me an atm near times square new york", "nearest atm", "atm near 94105".',
+      "Output includes Google Maps links.",
+    ].join(" "),
+    inputSchema: LocateAtmsInput,
   },
   async ({ query, limit }) => {
-    const result = await serpApiMapsSearch({
-      userQuery: query,
-      limit,
-    });
+    const result = await serpApiMapsSearch({ userQuery: query, limit });
 
     return {
       content: [
@@ -194,10 +200,7 @@ server.tool(
           text: JSON.stringify(
             {
               ...result,
-              assumption:
-                "Results are limited to Bank of America ATMs by default.",
-              usage_notes:
-                "Use this response to present nearby Bank of America ATMs with addresses and Google Maps links for directions.",
+              assumption: "Results are limited to Bank of America ATMs by default.",
               attribution:
                 "Results powered by SerpApi Google Maps engine; map links point to Google Maps.",
             },
@@ -211,9 +214,24 @@ server.tool(
 );
 
 
+const ok = forceToolDescription(
+  server,
+  "locate_atms",
+  "Find nearby ATMs (assumes Bank of America). Use whenever the user asks for an ATM, nearest ATM, or cash withdrawal near a place. Input is location text or a full sentence. Returns 5 results by default with Google Maps links."
+);
+
+console.log("Tool description patched:", ok);
+
+
+
 async function main() {
   const app = express();
-  app.use(express.json({ limit: "1mb" }));
+
+  // Parse JSON only for non-GET (SSE GET should not be parsed)
+  app.use((req, res, next) => {
+    if (req.method === "GET") return next();
+    return express.json({ limit: "1mb" })(req, res, next);
+  });
 
   app.get("/", (_req, res) => {
     res.status(200).send("ATM Locator MCP is running. Use /mcp");
@@ -223,15 +241,67 @@ async function main() {
     res.status(200).send("ok");
   });
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
-  });
+  // One MCP server instance is fine
+  const mcpServer = server;
 
-  await server.connect(transport);
+  // One transport per session
+  const sessions = new Map(); // sessionId -> transport
+
+  function getSessionId(req) {
+    // MCP Streamable HTTP uses a session id. Depending on client, it can appear in:
+    // - query param: ?sessionId=...
+    // - header: mcp-session-id
+    // We support both.
+    return (
+      (req.query && (req.query.sessionId || req.query.session_id)) ||
+      req.headers["mcp-session-id"] ||
+      req.headers["mcp-sessionid"] ||
+      null
+    );
+  }
+
+  async function getOrCreateTransport(req) {
+    let sessionId = getSessionId(req);
+
+    // If client did not provide one yet, create one and return it in a header.
+    // Some clients will send a new session id on the next request.
+    if (!sessionId) {
+      sessionId = crypto.randomUUID();
+    }
+
+    if (!sessions.has(sessionId)) {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionId,
+      });
+
+      await mcpServer.connect(transport);
+      sessions.set(sessionId, transport);
+    }
+
+    return { sessionId, transport: sessions.get(sessionId) };
+  }
 
   app.all("/mcp", async (req, res) => {
     try {
+      // SSE hints
+      if (req.method === "GET") {
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache, no-transform");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+      }
+
+      const { sessionId, transport } = await getOrCreateTransport(req);
+
+      // Help clients keep the session
+      res.setHeader("mcp-session-id", sessionId);
+
       await transport.handleRequest(req, res, req.body);
+
+      // Cleanup on DELETE if client ends session
+      if (req.method === "DELETE") {
+        sessions.delete(sessionId);
+      }
     } catch (error) {
       console.error("Error handling MCP request:", error);
       if (!res.headersSent) {
@@ -249,6 +319,7 @@ async function main() {
     console.log(`ATM Locator MCP running on http://localhost:${PORT}/mcp`);
   });
 }
+
 
 main().catch((err) => {
   console.error("Fatal startup error:", err);
