@@ -230,8 +230,13 @@ app.all("/mcp", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/", (_req, res) => {
+  res.status(200).send("ATM Locator MCP is running. Use /mcp");
+});
 
+app.get("/health", (_req, res) => {
+  res.status(200).send("ok");
+});
 
   const PORT = Number(process.env.PORT || 3337);
   app.listen(PORT, () => {
